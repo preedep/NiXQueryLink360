@@ -1,3 +1,14 @@
+//! Bearer token authentication middleware for Axum.
+//!
+//! All SQL API routes are protected by [`require_auth`].  The middleware
+//! extracts the token from the `Authorization` header and injects it as a
+//! [`BearerToken`] extension so downstream handlers can forward it to the
+//! upstream Databricks API.
+//!
+//! The proxy does **not** validate the token itself — validation is delegated
+//! to Databricks.  This keeps the proxy stateless and avoids needing its own
+//! token store.
+
 use axum::{
     extract::Request,
     http::{HeaderMap, StatusCode},
@@ -7,7 +18,21 @@ use axum::{
 };
 use serde_json::json;
 
-/// Extract Bearer token from Authorization header
+/// Newtype wrapper that carries the Bearer token through Axum request extensions.
+///
+/// Handlers extract it via `Extension<BearerToken>` and forward it to the
+/// upstream Databricks API.
+#[derive(Clone)]
+pub struct BearerToken(pub String);
+
+/// Extract a Bearer token from an HTTP `Authorization` header.
+///
+/// Returns `None` if:
+/// - The `Authorization` header is absent
+/// - The scheme is not `Bearer`
+/// - The token value is empty or whitespace-only after trimming
+///
+/// The returned token has leading and trailing whitespace stripped.
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get("Authorization")
@@ -17,7 +42,22 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Axum middleware: require Bearer token, inject into request extensions
+/// Axum middleware that enforces Bearer token authentication.
+///
+/// If a valid token is present it is injected into the request extensions
+/// as [`BearerToken`] and the request is passed to the next handler.
+///
+/// If the token is missing or malformed the middleware short-circuits with
+/// `401 Unauthorized` and a JSON error body compatible with the Databricks
+/// API error format.
+///
+/// # Response on failure
+/// ```json
+/// {
+///   "error_code": "UNAUTHENTICATED",
+///   "message": "Missing or invalid Authorization header. Use: Bearer <token>"
+/// }
+/// ```
 pub async fn require_auth(request: Request, next: Next) -> Response {
     let token = extract_bearer_token(request.headers());
 
@@ -36,10 +76,6 @@ pub async fn require_auth(request: Request, next: Next) -> Response {
         ).into_response(),
     }
 }
-
-/// Newtype wrapper to carry the token through axum extensions
-#[derive(Clone)]
-pub struct BearerToken(pub String);
 
 #[cfg(test)]
 mod tests {

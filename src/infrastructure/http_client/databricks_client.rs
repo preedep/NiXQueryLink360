@@ -1,9 +1,24 @@
+//! Concrete implementation of [`WarehouseClient`] backed by the
+//! Databricks Statement Execution REST API v2.0.
+//!
+//! [`DatabricksClient`] uses a shared `reqwest::Client` connection pool and
+//! delegates retry logic to [`RetryPolicy`].  All internal DTOs use owned
+//! `String` fields so they can be cheaply cloned into retry closures.
+//!
+//! # Token resolution
+//! The Bearer token is resolved at request time in the following order:
+//! 1. Environment variable named by `warehouse.token_env` (highest priority)
+//! 2. Token forwarded by the caller via the `Authorization` header
+//!
+//! This design allows per-warehouse service accounts while still permitting
+//! caller-supplied tokens for fine-grained access control.
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::domain::{
     entities::statement::{
@@ -15,48 +30,84 @@ use crate::domain::{
 use crate::infrastructure::config::settings::WarehouseSettings;
 use super::retry::RetryPolicy;
 
-// ---------- Databricks API DTOs (all owned — required for retry cloning) ----------
+// ── Databricks API DTOs ───────────────────────────────────────────────────────
+// All fields are owned Strings so the structs implement Clone and can be
+// captured by the retry closure without lifetime issues.
 
-/// Request body sent to Databricks Statement Execution API v2.0
+/// JSON request body for `POST /api/2.0/sql/statements`.
 #[derive(Debug, Serialize, Clone)]
 struct DatabricksStatementRequest {
+    /// The SQL text to execute.
     statement: String,
+    /// Target warehouse identifier.
     warehouse_id: String,
+    /// Synchronous wait timeout, e.g. `"10s"`. `"0s"` means pure async.
     wait_timeout: String,
+    /// Action on timeout: `"CONTINUE"` or `"CANCEL"`.
     on_wait_timeout: String,
+    /// Result format: `"JSON_ARRAY"` or `"ARROW_STREAM"`.
     format: String,
+    /// Result delivery: `"INLINE"` or `"EXTERNAL_LINKS"`.
     disposition: String,
 }
 
+/// JSON response body for statement submit and poll endpoints.
 #[derive(Debug, Deserialize)]
 struct DatabricksStatementResponse {
     statement_id: String,
     status: DatabricksStatus,
+    /// Column schema and pagination metadata (present when `SUCCEEDED`).
     manifest: Option<serde_json::Value>,
+    /// Result rows (present when `SUCCEEDED` and disposition is `INLINE`).
     result: Option<serde_json::Value>,
 }
 
+/// Lifecycle state and optional error from the Databricks API.
 #[derive(Debug, Deserialize)]
 struct DatabricksStatus {
+    /// State string, e.g. `"RUNNING"`, `"SUCCEEDED"`, `"FAILED"`.
     state: String,
+    /// Populated when `state == "FAILED"`.
     error: Option<DatabricksError>,
 }
 
+/// Error details returned by Databricks when a statement fails.
 #[derive(Debug, Deserialize)]
 struct DatabricksError {
+    /// Human-readable description of the failure.
     message: String,
+    /// Machine-readable error code, e.g. `"PARSE_SYNTAX_ERROR"`.
     error_code: Option<String>,
 }
 
-// ---------- Client ----------
+// ── Client ────────────────────────────────────────────────────────────────────
 
+/// `reqwest`-backed implementation of [`WarehouseClient`].
+///
+/// One instance is created at startup and shared across all concurrent
+/// requests via [`std::sync::Arc`].  The underlying `reqwest::Client` is
+/// `Arc`-backed internally, so cloning it is cheap.
 pub struct DatabricksClient {
+    /// Shared connection pool — `Arc`-backed; cheap to clone.
     http: Client,
+    /// Map of warehouse ID → connection settings, populated at startup.
     warehouses: HashMap<String, WarehouseSettings>,
+    /// Retry policy applied to submit requests.
     retry: RetryPolicy,
 }
 
 impl DatabricksClient {
+    /// Construct a new client from configuration.
+    ///
+    /// # Parameters
+    /// - `warehouses`            — list of warehouse configurations
+    /// - `pool_max_connections`  — max idle connections per host
+    /// - `connect_timeout_secs`  — TCP connect timeout
+    /// - `retry`                 — retry policy for submit requests
+    ///
+    /// # Errors
+    /// Returns an [`anyhow::Error`] if the underlying `reqwest` client
+    /// cannot be built (e.g. invalid TLS configuration).
     pub fn new(
         warehouses: Vec<WarehouseSettings>,
         pool_max_connections: u32,
@@ -78,6 +129,11 @@ impl DatabricksClient {
         Ok(DatabricksClient { http, warehouses, retry })
     }
 
+    /// Look up warehouse settings by ID.
+    ///
+    /// # Errors
+    /// Returns [`DomainError::WarehouseNotFound`] if `warehouse_id` is not
+    /// present in the configured warehouse map.
     fn get_warehouse(&self, warehouse_id: &str) -> Result<&WarehouseSettings, DomainError> {
         self.warehouses
             .get(warehouse_id)
@@ -86,12 +142,21 @@ impl DatabricksClient {
             })
     }
 
-    /// Resolve token: prefer env var over fallback
+    /// Resolve the Bearer token to use for a request.
+    ///
+    /// If the environment variable named by `warehouse.token_env` is set
+    /// and non-empty, it takes precedence over the caller-supplied token.
+    /// This allows per-warehouse service-account tokens to be injected at
+    /// runtime without changing the API surface.
     fn resolve_token(&self, warehouse: &WarehouseSettings, fallback_token: &str) -> String {
         std::env::var(&warehouse.token_env)
             .unwrap_or_else(|_| fallback_token.to_string())
     }
 
+    /// Map a Databricks state string to the domain [`StatementState`] enum.
+    ///
+    /// Unknown strings (e.g. future Databricks additions) are mapped to
+    /// `Failed` as a safe fallback so callers always receive a terminal state.
     fn map_state(state_str: &str) -> StatementState {
         match state_str {
             "PENDING"   => StatementState::Pending,
@@ -100,10 +165,14 @@ impl DatabricksClient {
             "FAILED"    => StatementState::Failed,
             "CANCELLED" => StatementState::Cancelled,
             "CLOSED"    => StatementState::Closed,
-            _           => StatementState::Failed,
+            other => {
+                debug!(state = other, "Unknown Databricks state — falling back to Failed");
+                StatementState::Failed
+            }
         }
     }
 
+    /// Convert a [`StatementFormat`] variant to the Databricks API string.
     fn format_str(format: &StatementFormat) -> &'static str {
         match format {
             StatementFormat::JsonArray   => "JSON_ARRAY",
@@ -111,6 +180,7 @@ impl DatabricksClient {
         }
     }
 
+    /// Convert a [`StatementDisposition`] variant to the Databricks API string.
     fn disposition_str(disposition: &StatementDisposition) -> &'static str {
         match disposition {
             StatementDisposition::Inline        => "INLINE",
@@ -118,7 +188,10 @@ impl DatabricksClient {
         }
     }
 
-    /// Convert raw API response into domain StatementResult
+    /// Convert a raw Databricks API response into the domain [`StatementResult`].
+    ///
+    /// Extracts `data_array` from `result` and `schema` / `total_row_count`
+    /// from `manifest` when present.
     fn parse_response(db_resp: DatabricksStatementResponse) -> StatementResult {
         StatementResult {
             state: Self::map_state(&db_resp.status.state),
@@ -139,8 +212,14 @@ impl DatabricksClient {
     }
 }
 
+// ── WarehouseClient implementation ───────────────────────────────────────────
+
 #[async_trait]
 impl WarehouseClient for DatabricksClient {
+    /// Submit a SQL statement and return the initial (or final) result.
+    ///
+    /// Retries the POST request according to the configured [`RetryPolicy`]
+    /// on transient status codes (`429`, `5xx`).
     async fn submit_statement(
         &self,
         statement: &Statement,
@@ -150,7 +229,8 @@ impl WarehouseClient for DatabricksClient {
         let resolved_token = self.resolve_token(warehouse, token);
         let url = format!("https://{}/api/2.0/sql/statements", warehouse.host);
 
-        // Build owned body (Clone-able) so the retry closure can re-use it
+        // Build an owned, Clone-able body so the retry closure can re-use it
+        // without lifetime issues.
         let body = DatabricksStatementRequest {
             statement:      statement.sql.clone(),
             warehouse_id:   statement.warehouse_id.clone(),
@@ -163,19 +243,24 @@ impl WarehouseClient for DatabricksClient {
             disposition: Self::disposition_str(&statement.disposition).to_string(),
         };
 
-        debug!(url = %url, warehouse_id = %statement.warehouse_id, "Submitting statement");
+        debug!(
+            url = %url,
+            warehouse_id = %statement.warehouse_id,
+            statement_id = %statement.id,
+            "POSTing statement to Databricks"
+        );
 
-        // Clone all values the retry closure needs — reqwest::Client is Arc-backed (cheap clone)
-        let http    = self.http.clone();
-        let tok     = resolved_token.clone();
-        let req_url = url.clone();
+        // reqwest::Client is Arc-backed — clone is cheap.
+        let http     = self.http.clone();
+        let tok      = resolved_token.clone();
+        let req_url  = url.clone();
         let req_body = body.clone();
 
         let resp = self.retry.execute(|| {
-            let c  = http.clone();
-            let t  = tok.clone();
-            let u  = req_url.clone();
-            let b  = req_body.clone();
+            let c = http.clone();
+            let t = tok.clone();
+            let u = req_url.clone();
+            let b = req_body.clone();
             async move {
                 c.post(&u)
                     .bearer_auth(&t)
@@ -190,12 +275,17 @@ impl WarehouseClient for DatabricksClient {
 
         if status == 401 || status == 403 {
             return Err(DomainError::AuthenticationFailed {
-                message: "Databricks rejected the token".to_string(),
+                message: "Databricks rejected the Bearer token".to_string(),
             });
         }
         if !resp.status().is_success() {
             let err_text = resp.text().await.unwrap_or_default();
-            error!(status = status, body = %err_text, "Upstream error on submit");
+            error!(
+                status,
+                body = %err_text,
+                warehouse_id = %statement.warehouse_id,
+                "Databricks returned error on submit"
+            );
             return Err(DomainError::UpstreamError {
                 message: format!("HTTP {}: {}", status, err_text),
             });
@@ -207,9 +297,16 @@ impl WarehouseClient for DatabricksClient {
             }
         })?;
 
+        info!(
+            statement_id = %db_resp.statement_id,
+            state = %db_resp.status.state,
+            "Databricks accepted statement"
+        );
+
         Ok(Self::parse_response(db_resp))
     }
 
+    /// Poll the current state and result of an existing statement.
     async fn get_statement(
         &self,
         statement_id: &str,
@@ -223,7 +320,11 @@ impl WarehouseClient for DatabricksClient {
             warehouse.host, statement_id
         );
 
-        debug!(url = %url, statement_id = %statement_id, "Getting statement");
+        debug!(
+            url = %url,
+            statement_id = %statement_id,
+            "GETting statement from Databricks"
+        );
 
         let resp = self.http
             .get(&url)
@@ -232,16 +333,23 @@ impl WarehouseClient for DatabricksClient {
             .await
             .map_err(|e| DomainError::UpstreamError { message: e.to_string() })?;
 
-        if resp.status().as_u16() == 404 {
+        let status = resp.status().as_u16();
+
+        if status == 404 {
             return Err(DomainError::StatementNotFound {
                 statement_id: statement_id.to_string(),
             });
         }
         if !resp.status().is_success() {
-            let status_code = resp.status().as_u16();
             let err_text = resp.text().await.unwrap_or_default();
+            error!(
+                status,
+                body = %err_text,
+                statement_id = %statement_id,
+                "Databricks returned error on get"
+            );
             return Err(DomainError::UpstreamError {
-                message: format!("HTTP {}: {}", status_code, err_text),
+                message: format!("HTTP {}: {}", status, err_text),
             });
         }
 
@@ -254,6 +362,7 @@ impl WarehouseClient for DatabricksClient {
         Ok(Self::parse_response(db_resp))
     }
 
+    /// Send a cancellation request for an in-flight statement.
     async fn cancel_statement(
         &self,
         statement_id: &str,
@@ -267,7 +376,11 @@ impl WarehouseClient for DatabricksClient {
             warehouse.host, statement_id
         );
 
-        debug!(url = %url, statement_id = %statement_id, "Cancelling statement");
+        debug!(
+            url = %url,
+            statement_id = %statement_id,
+            "POSTing cancel request to Databricks"
+        );
 
         let resp = self.http
             .post(&url)
@@ -276,19 +389,27 @@ impl WarehouseClient for DatabricksClient {
             .await
             .map_err(|e| DomainError::UpstreamError { message: e.to_string() })?;
 
+        let status = resp.status().as_u16();
+
         if !resp.status().is_success() {
-            let status_code = resp.status().as_u16();
             let err_text = resp.text().await.unwrap_or_default();
+            error!(
+                status,
+                body = %err_text,
+                statement_id = %statement_id,
+                "Databricks returned error on cancel"
+            );
             return Err(DomainError::UpstreamError {
-                message: format!("HTTP {}: {}", status_code, err_text),
+                message: format!("HTTP {}: {}", status, err_text),
             });
         }
 
+        info!(statement_id = %statement_id, "Databricks accepted cancellation request");
         Ok(())
     }
 }
 
-// ---------- Unit Tests ----------
+// ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

@@ -1,15 +1,26 @@
+//! Use case: cancel a running SQL statement.
+
 use std::sync::Arc;
+use tracing::{info, warn};
 use crate::domain::{
     errors::DomainError,
     ports::warehouse_client::WarehouseClient,
 };
 
+/// Input for cancelling a statement that is PENDING or RUNNING.
 pub struct CancelStatementInput {
+    /// Databricks statement ID to cancel.
     pub statement_id: String,
+    /// Warehouse the statement belongs to (used for routing).
     pub warehouse_id: String,
     pub token: String,
 }
 
+/// Requests cancellation of an in-flight SQL statement.
+///
+/// Cancellation is best-effort — if the statement has already reached a
+/// terminal state (`SUCCEEDED`, `FAILED`, `CANCELLED`) the upstream may
+/// return an error, which is propagated as [`DomainError::UpstreamError`].
 pub struct CancelStatementUseCase {
     client: Arc<dyn WarehouseClient>,
 }
@@ -19,15 +30,31 @@ impl CancelStatementUseCase {
         CancelStatementUseCase { client }
     }
 
+    /// Execute the use case.
+    ///
+    /// # Errors
+    /// - [`DomainError::InvalidRequest`] — `statement_id` is empty
+    /// - [`DomainError::UpstreamError`] — upstream returned an unexpected error
     pub async fn execute(&self, input: CancelStatementInput) -> Result<(), DomainError> {
         if input.statement_id.trim().is_empty() {
+            warn!("cancel_statement called with empty statement_id");
             return Err(DomainError::InvalidRequest {
                 message: "statement_id cannot be empty".to_string(),
             });
         }
-        self.client
+
+        info!(statement_id = %input.statement_id, "Requesting statement cancellation");
+
+        let result = self.client
             .cancel_statement(&input.statement_id, &input.warehouse_id, &input.token)
-            .await
+            .await;
+
+        match &result {
+            Ok(_)  => info!(statement_id = %input.statement_id, "Statement cancelled successfully"),
+            Err(e) => warn!(statement_id = %input.statement_id, error = %e, "Statement cancellation failed"),
+        }
+
+        result
     }
 }
 

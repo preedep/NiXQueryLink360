@@ -1,31 +1,82 @@
+//! Generic exponential-backoff retry policy for async operations.
+//!
+//! [`RetryPolicy`] wraps any async closure and re-executes it up to
+//! `max_attempts` times, sleeping an exponentially increasing delay between
+//! each failure.  It is agnostic to the error type so it can be reused for
+//! any fallible future (HTTP requests, background jobs, etc.).
+//!
+//! # Retry schedule (example: `base_delay_ms = 500`, `max_attempts = 3`)
+//! | Attempt | Delay before next try |
+//! |---------|-----------------------|
+//! | 1 (initial) | — (no delay)      |
+//! | 2           | 500 ms             |
+//! | 3           | 1 000 ms           |
+//!
+//! After `max_attempts` failures the last error is returned to the caller.
+
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::warn;
 
-/// Retry policy with exponential backoff
+/// Exponential-backoff retry policy.
+///
+/// Cheaply [`Clone`]-able so it can be shared with the HTTP client and
+/// passed into retry closures without reference counting overhead.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
+    /// Total number of attempts (initial try + retries).  Must be ≥ 1.
     pub max_attempts: u32,
+
+    /// Base delay in milliseconds.  The delay before attempt `n` (0-indexed)
+    /// is `base_delay_ms * 2^n`.
     pub base_delay_ms: u64,
 }
 
 impl RetryPolicy {
+    /// Create a new policy with the given limits.
+    ///
+    /// # Parameters
+    /// - `max_attempts`  — total number of attempts (≥ 1; `1` means no retries)
+    /// - `base_delay_ms` — seed delay in milliseconds for the backoff formula
     pub fn new(max_attempts: u32, base_delay_ms: u64) -> Self {
         RetryPolicy { max_attempts, base_delay_ms }
     }
 
-    /// Check if an HTTP status code is retryable
+    /// Returns `true` if the given HTTP status code should trigger a retry.
+    ///
+    /// Retryable codes: `429 Too Many Requests`, `500 Internal Server Error`,
+    /// `502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway Timeout`.
     pub fn is_retryable_status(status: u16) -> bool {
         matches!(status, 429 | 500 | 502 | 503 | 504)
     }
 
-    /// Calculate delay for a given attempt (0-indexed)
+    /// Calculate the backoff delay for a given attempt index (0-indexed).
+    ///
+    /// Formula: `base_delay_ms * 2^attempt`
+    ///
+    /// # Example
+    /// ```text
+    /// attempt 0 → base_delay_ms * 1
+    /// attempt 1 → base_delay_ms * 2
+    /// attempt 2 → base_delay_ms * 4
+    /// ```
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let multiplier = 2u64.pow(attempt);
         Duration::from_millis(self.base_delay_ms * multiplier)
     }
 
-    /// Execute a future with retry logic
+    /// Execute `f` with automatic retries on failure.
+    ///
+    /// `f` is called at most `max_attempts` times.  On each failure a
+    /// structured warning is emitted that includes the attempt number, the
+    /// total allowed attempts, the upcoming delay, and the error value.
+    /// After the final attempt the last error is returned unchanged.
+    ///
+    /// # Type parameters
+    /// - `F`  — closure that produces a new future on each call
+    /// - `Fut`— the future returned by `F`
+    /// - `T`  — success value
+    /// - `E`  — error type (must implement `Debug` for logging)
     pub async fn execute<F, Fut, T, E>(&self, mut f: F) -> Result<T, E>
     where
         F: FnMut() -> Fut,
@@ -33,18 +84,35 @@ impl RetryPolicy {
         E: std::fmt::Debug,
     {
         let mut last_err = None;
+
         for attempt in 0..self.max_attempts {
             match f().await {
                 Ok(val) => return Ok(val),
                 Err(e) => {
-                    warn!(attempt = attempt, error = ?e, "Request failed, will retry");
-                    last_err = Some(e);
-                    if attempt < self.max_attempts - 1 {
+                    let remaining = self.max_attempts - attempt - 1;
+                    if remaining > 0 {
+                        let delay_ms = self.delay_for_attempt(attempt).as_millis();
+                        warn!(
+                            attempt = attempt + 1,
+                            max_attempts = self.max_attempts,
+                            delay_ms,
+                            error = ?e,
+                            "Request failed — retrying after backoff"
+                        );
                         sleep(self.delay_for_attempt(attempt)).await;
+                    } else {
+                        warn!(
+                            attempt = attempt + 1,
+                            max_attempts = self.max_attempts,
+                            error = ?e,
+                            "Request failed — no retries remaining"
+                        );
                     }
+                    last_err = Some(e);
                 }
             }
         }
+
         Err(last_err.unwrap())
     }
 }

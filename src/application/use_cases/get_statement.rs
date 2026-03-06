@@ -1,16 +1,26 @@
+//! Use case: poll the current status and result of a submitted statement.
+
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 use crate::domain::{
     entities::statement::StatementResult,
     errors::DomainError,
     ports::warehouse_client::WarehouseClient,
 };
 
+/// Input for polling a previously submitted statement.
 pub struct GetStatementInput {
+    /// Databricks statement ID returned by the submit call.
     pub statement_id: String,
+    /// Warehouse the statement belongs to (used for routing).
     pub warehouse_id: String,
     pub token: String,
 }
 
+/// Fetches the current state and result of an existing statement.
+///
+/// This use case is called repeatedly by clients that use the
+/// async (poll) pattern: submit → poll until `SUCCEEDED | FAILED | CANCELLED`.
 pub struct GetStatementUseCase {
     client: Arc<dyn WarehouseClient>,
 }
@@ -20,15 +30,44 @@ impl GetStatementUseCase {
         GetStatementUseCase { client }
     }
 
+    /// Execute the use case.
+    ///
+    /// # Errors
+    /// - [`DomainError::InvalidRequest`] — `statement_id` is empty
+    /// - [`DomainError::StatementNotFound`] — ID not found in the upstream
+    /// - [`DomainError::UpstreamError`] — upstream returned an unexpected error
     pub async fn execute(&self, input: GetStatementInput) -> Result<StatementResult, DomainError> {
         if input.statement_id.trim().is_empty() {
+            warn!("get_statement called with empty statement_id");
             return Err(DomainError::InvalidRequest {
                 message: "statement_id cannot be empty".to_string(),
             });
         }
-        self.client
+
+        debug!(statement_id = %input.statement_id, "Polling statement status");
+
+        let start = std::time::Instant::now();
+        let result = self.client
             .get_statement(&input.statement_id, &input.warehouse_id, &input.token)
-            .await
+            .await;
+        let elapsed_ms = start.elapsed().as_millis();
+
+        match &result {
+            Ok(r) => info!(
+                statement_id = %input.statement_id,
+                state = ?r.state,
+                elapsed_ms,
+                "Statement poll succeeded"
+            ),
+            Err(e) => warn!(
+                statement_id = %input.statement_id,
+                error = %e,
+                elapsed_ms,
+                "Statement poll failed"
+            ),
+        }
+
+        result
     }
 }
 
