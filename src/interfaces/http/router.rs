@@ -57,8 +57,8 @@ pub fn create_router(settings: Settings) -> Result<Router> {
     // SQL API routes (require auth)
     let api_routes = Router::new()
         .route("/api/2.0/sql/statements", post(submit_statement))
-        .route("/api/2.0/sql/statements/:statement_id", get(get_statement))
-        .route("/api/2.0/sql/statements/:statement_id/cancel", delete(cancel_statement))
+        .route("/api/2.0/sql/statements/{statement_id}", get(get_statement))
+        .route("/api/2.0/sql/statements/{statement_id}/cancel", delete(cancel_statement))
         .layer(middleware::from_fn(require_auth));
 
     // Public routes

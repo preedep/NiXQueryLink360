@@ -1,5 +1,4 @@
 use axum::{
-    body::Body,
     extract::Request,
     http::{HeaderMap, StatusCode},
     middleware::Next,
@@ -19,7 +18,7 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Axum middleware: require Bearer token, inject into request extensions
-pub async fn require_auth(request: Request<Body>, next: Next) -> Response {
+pub async fn require_auth(request: Request, next: Next) -> Response {
     let token = extract_bearer_token(request.headers());
 
     match token {
