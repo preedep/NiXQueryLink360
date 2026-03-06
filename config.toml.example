@@ -1,0 +1,26 @@
+[server]
+host = "0.0.0.0"
+port = 8360
+request_timeout_secs = 30
+
+[upstream]
+default_warehouse_id = "dev-warehouse"
+
+[[upstream.warehouses]]
+id = "dev-warehouse"
+host = "adb-xxxx.azuredatabricks.net"
+http_path = "/sql/1.0/warehouses/abc123"
+token_env = "DATABRICKS_TOKEN"
+
+[pool]
+max_connections = 50
+connection_timeout_secs = 10
+idle_timeout_secs = 300
+
+[retry]
+max_attempts = 3
+base_delay_ms = 500
+
+[logging]
+level = "info"
+format = "pretty"
